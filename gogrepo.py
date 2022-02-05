@@ -29,6 +29,7 @@ import datetime
 import shutil
 import socket
 import xml.etree.ElementTree
+from random import shuffle
 
 # python 2 / 3 imports
 try:
@@ -109,10 +110,6 @@ HTTP_RETRY_COUNT = 3
 HTTP_GAME_DOWNLOADER_THREADS = 4
 HTTP_PERM_ERRORCODES = (404, 403, 503)
 
-# Save manifest data for these os and lang combinations
-DEFAULT_OS_LIST = ['windows']
-DEFAULT_LANG_LIST = ['en']
-
 # These file types don't have md5 data from GOG
 SKIP_MD5_FILE_EXT = ['.txt', '.zip']
 
@@ -147,6 +144,10 @@ LANG_TABLE = {'en': u'English',   # English
 
 VALID_OS_TYPES = ['windows', 'linux', 'mac']
 VALID_LANG_TYPES = list(LANG_TABLE.keys())
+
+# Save manifest data for these os and lang combinations
+DEFAULT_OS_LIST = VALID_OS_TYPES
+DEFAULT_LANG_LIST = VALID_LANG_TYPES
 
 ORPHAN_DIR_NAME = '!orphaned'
 ORPHAN_DIR_EXCLUDE_LIST = [ORPHAN_DIR_NAME, '!misc']
@@ -469,6 +470,7 @@ def process_argv(argv):
     g1.add_argument('-wait', action='store', type=float,
                     help='wait this long in hours before starting', default=0.0)  # sleep in hr
     g1.add_argument('-skipids', action='store', help='id[s] of the game[s] in the manifest to NOT download')
+    g1.add_argument('-randomorder', action='store_true', help='download games in random order')
 
     g1 = sp1.add_parser('import', help='Import files with any matching MD5 checksums found in manifest')
     g1.add_argument('src_dir', action='store', help='source directory to import games from')
@@ -771,7 +773,7 @@ def cmd_import(src_dir, dest_dir):
             shutil.copy(f, dest_file)
 
 
-def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
+def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id, randomorder):
     sizes, rates, errors = {}, {}, {}
     work = Queue()  # build a list of work items
 
@@ -781,10 +783,21 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
     work_dict = dict()
 
     # util
+    def kibs(b):
+        return '%.1fKB' % (b / float(1024))
     def megs(b):
         return '%.1fMB' % (b / float(1024**2))
     def gigs(b):
         return '%.2fGB' % (b / float(1024**3))
+    def auto_size(b):
+        if b > 1024**3:
+            return gigs(b)
+        elif b > 1024**2:
+            return megs(b)
+        elif b > 1024:
+            return kibs(b)
+        else:
+            return '%dB' % (b)
 
     if id:
         id_found = False
@@ -802,8 +815,12 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
         ignore_list = skipids.split(",")
         items[:] = [item for item in items if item.title not in ignore_list]
 
+    if randomorder:
+        shuffle(items)
+    else:
+        items = sorted(items, key=lambda g: g.title)
     # Find all items to be downloaded and push into work queue
-    for item in sorted(items, key=lambda g: g.title):
+    for item in items:
         info("{%s}" % item.title)
         item_homedir = os.path.join(savedir, item.title)
         if not dryrun:
@@ -880,7 +897,7 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
         work.put(work_dict[work_item])
 
     if dryrun:
-        info("{} left to download".format(gigs(sum(sizes.values()))))
+        info("{} left to download".format(auto_size(sum(sizes.values()))))
         return  # bail, as below just kicks off the actual downloading
 
     info('-'*60)
@@ -943,10 +960,10 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
                     szs, ts = flows.get(tid, (0, 0))
                     flows[tid] = sz + szs, t + ts
                 bps = sum(szs/ts for szs, ts in list(flows.values()) if ts > 0)
-                info('%10s %8.1fMB/s %2dx  %s' % \
-                    (megs(sizes[path]), bps / 1024.0**2, len(flows), "%s/%s" % (os.path.basename(os.path.split(path)[0]), os.path.split(path)[1])))
+                info('%10s %s/s %2dx  %s' % \
+                    (auto_size(sizes[path]), auto_size(bps), len(flows), "%s/%s" % (os.path.basename(os.path.split(path)[0]), os.path.split(path)[1])))
             if len(rates) != 0:  # only update if there's change
-                info('%s remaining' % gigs(left))
+                info('%s remaining' % auto_size(left))
             rates.clear()
 
     # process work items with a thread pool
@@ -1147,7 +1164,7 @@ def main(args):
         if args.wait > 0.0:
             info('sleeping for %.2fhr...' % args.wait)
             time.sleep(args.wait * 60 * 60)
-        cmd_download(args.savedir, args.skipextras, args.skipgames, args.skipids, args.dryrun, args.id)
+        cmd_download(args.savedir, args.skipextras, args.skipgames, args.skipids, args.dryrun, args.id, args.randomorder)
     elif args.cmd == 'import':
         cmd_import(args.src_dir, args.dest_dir)
     elif args.cmd == 'verify':
