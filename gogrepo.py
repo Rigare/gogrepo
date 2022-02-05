@@ -29,6 +29,7 @@ import datetime
 import shutil
 import socket
 import xml.etree.ElementTree
+from random import shuffle
 
 # python 2 / 3 imports
 try:
@@ -109,10 +110,6 @@ HTTP_RETRY_COUNT = 3
 HTTP_GAME_DOWNLOADER_THREADS = 4
 HTTP_PERM_ERRORCODES = (404, 403, 503)
 
-# Save manifest data for these os and lang combinations
-DEFAULT_OS_LIST = ['windows']
-DEFAULT_LANG_LIST = ['en']
-
 # These file types don't have md5 data from GOG
 SKIP_MD5_FILE_EXT = ['.txt', '.zip']
 
@@ -147,6 +144,10 @@ LANG_TABLE = {'en': u'English',   # English
 
 VALID_OS_TYPES = ['windows', 'linux', 'mac']
 VALID_LANG_TYPES = list(LANG_TABLE.keys())
+
+# Save manifest data for these os and lang combinations
+DEFAULT_OS_LIST = VALID_OS_TYPES
+DEFAULT_LANG_LIST = VALID_LANG_TYPES
 
 ORPHAN_DIR_NAME = '!orphaned'
 ORPHAN_DIR_EXCLUDE_LIST = [ORPHAN_DIR_NAME, '!misc']
@@ -325,11 +326,30 @@ def item_checkdb(search_id, gamesdb):
         if search_id == gamesdb[i].id:
             return i
     return None
+    
+    
+def move_outdated_files(savedir, olditem, newitem):
+    # move all files that were replaced by a new version (that is files that were in the previous manifest but aren't in the new manifest)
+    # into a version sub-directory prefixed with '!version_'
+    for download in olditem.downloads:
+        if download.name not in [d.name for d in newitem.downloads]:
+            src = os.path.join(savedir, olditem.title, download.name)
+            dst = os.path.join(savedir, olditem.title, '!version_{}'.format(download.version))
+            
+            if os.path.isfile(src):
+                if not os.path.isdir(dst):
+                    os.makedirs(dst)
+                shutil.move(src, os.path.join(dst, download.name))
 
 
-def handle_game_updates(olditem, newitem):
+def handle_game_updates(olditem, newitem, savedir, moveoutdated):
     if newitem.has_updates:
         info('  -> gog flagged this game as updated')
+        
+        # When game has been updated, let's move outdated files to a separate sub-folder dedicated for the older version
+        # so the main game folder remains clean
+        if moveoutdated:
+            move_outdated_files(savedir, olditem, newitem)
 
     if olditem.title != newitem.title:
         info('  -> title has changed "{}" -> "{}"'.format(olditem.title, newitem.title))
@@ -453,8 +473,10 @@ def process_argv(argv):
     g1.add_argument('password', action='store', help='GOG password', nargs='?', default=None)
 
     g1 = sp1.add_parser('update', help='Update locally saved game manifest from GOG server')
+    g1.add_argument('savedir', action='store', help='directory with saved downloads', nargs='?', default='.')
     g1.add_argument('-os', action='store', help='operating system(s)', nargs='*', default=DEFAULT_OS_LIST)
     g1.add_argument('-lang', action='store', help='game language(s)', nargs='*', default=DEFAULT_LANG_LIST)
+    g1.add_argument('-moveoutdated', action='store_true', help='move outdated files to version sub-directories')
     g2 = g1.add_mutually_exclusive_group()  # below are mutually exclusive
     g2.add_argument('-skipknown', action='store_true', help='skip games already known by manifest')
     g2.add_argument('-updateonly', action='store_true', help='only games marked with the update tag')
@@ -465,10 +487,12 @@ def process_argv(argv):
     g1.add_argument('-dryrun', action='store_true', help='display, but skip downloading of any files')
     g1.add_argument('-skipextras', action='store_true', help='skip downloading of any GOG extra files')
     g1.add_argument('-skipgames', action='store_true', help='skip downloading of any GOG game files')
+    g1.add_argument('-skippatches', action='store_true', help='skip downloading of any game patches')
     g1.add_argument('-id', action='store', help='id of the game in the manifest to download')
     g1.add_argument('-wait', action='store', type=float,
                     help='wait this long in hours before starting', default=0.0)  # sleep in hr
     g1.add_argument('-skipids', action='store', help='id[s] of the game[s] in the manifest to NOT download')
+    g1.add_argument('-randomorder', action='store_true', help='download games in random order')
 
     g1 = sp1.add_parser('import', help='Import files with any matching MD5 checksums found in manifest')
     g1.add_argument('src_dir', action='store', help='source directory to import games from')
@@ -596,7 +620,7 @@ def cmd_login(user, passwd):
         error('login failed, verify your username/password and try again.')
 
 
-def cmd_update(os_list, lang_list, skipknown, updateonly, id):
+def cmd_update(os_list, lang_list, savedir, moveoutdated, skipknown, updateonly, id):
     media_type = GOG_MEDIA_TYPE_GAME
     items = []
     known_ids = []
@@ -717,7 +741,7 @@ def cmd_update(os_list, lang_list, skipknown, updateonly, id):
                 # update gamesdb with new item
                 item_idx = item_checkdb(item.id, gamesdb)
                 if item_idx is not None:
-                    handle_game_updates(gamesdb[item_idx], item)
+                    handle_game_updates(gamesdb[item_idx], item, savedir, moveoutdated)
                     gamesdb[item_idx] = item
                 else:
                     gamesdb.append(item)
@@ -771,7 +795,7 @@ def cmd_import(src_dir, dest_dir):
             shutil.copy(f, dest_file)
 
 
-def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
+def cmd_download(savedir, skipextras, skipgames, skippatches, skipids, dryrun, id):
     sizes, rates, errors = {}, {}, {}
     work = Queue()  # build a list of work items
 
@@ -781,10 +805,21 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
     work_dict = dict()
 
     # util
+    def kibs(b):
+        return '%.1fKB' % (b / float(1024))
     def megs(b):
         return '%.1fMB' % (b / float(1024**2))
     def gigs(b):
         return '%.2fGB' % (b / float(1024**3))
+    def auto_size(b):
+        if b > 1024**3:
+            return gigs(b)
+        elif b > 1024**2:
+            return megs(b)
+        elif b > 1024:
+            return kibs(b)
+        else:
+            return '%dB' % (b)
 
     if id:
         id_found = False
@@ -802,8 +837,12 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
         ignore_list = skipids.split(",")
         items[:] = [item for item in items if item.title not in ignore_list]
 
+    if randomorder:
+        shuffle(items)
+    else:
+        items = sorted(items, key=lambda g: g.title)
     # Find all items to be downloaded and push into work queue
-    for item in sorted(items, key=lambda g: g.title):
+    for item in items:
         info("{%s}" % item.title)
         item_homedir = os.path.join(savedir, item.title)
         if not dryrun:
@@ -815,6 +854,9 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
 
         if skipgames:
             item.downloads = []
+
+        if skippatches:
+            item.downloads = [d for d in item.downloads if not d["name"].startswith("patch_")]
 
         # Generate and save a game info text file
         if not dryrun:
@@ -880,7 +922,7 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
         work.put(work_dict[work_item])
 
     if dryrun:
-        info("{} left to download".format(gigs(sum(sizes.values()))))
+        info("{} left to download".format(auto_size(sum(sizes.values()))))
         return  # bail, as below just kicks off the actual downloading
 
     info('-'*60)
@@ -943,10 +985,10 @@ def cmd_download(savedir, skipextras, skipgames, skipids, dryrun, id):
                     szs, ts = flows.get(tid, (0, 0))
                     flows[tid] = sz + szs, t + ts
                 bps = sum(szs/ts for szs, ts in list(flows.values()) if ts > 0)
-                info('%10s %8.1fMB/s %2dx  %s' % \
-                    (megs(sizes[path]), bps / 1024.0**2, len(flows), "%s/%s" % (os.path.basename(os.path.split(path)[0]), os.path.split(path)[1])))
+                info('%10s %s/s %2dx  %s' % \
+                    (auto_size(sizes[path]), auto_size(bps), len(flows), "%s/%s" % (os.path.basename(os.path.split(path)[0]), os.path.split(path)[1])))
             if len(rates) != 0:  # only update if there's change
-                info('%s remaining' % gigs(left))
+                info('%s remaining' % auto_size(left))
             rates.clear()
 
     # process work items with a thread pool
@@ -1113,8 +1155,22 @@ def cmd_clean(cleandir, dryrun):
                     expected_filenames.append(game_item.name)
                 for cur_dir_file in os.listdir(cur_fulldir):
                     if os.path.isdir(os.path.join(cleandir, cur_dir, cur_dir_file)):
-                        continue  # leave subdirs alone
-                    if cur_dir_file not in expected_filenames and cur_dir_file not in ORPHAN_FILE_EXCLUDE_LIST:
+                        # orphan old version folders
+                        if cur_dir_file.startswith('!version'):
+                            info('Orphaning old version folder {}'.format(os.path.join(cleandir, cur_dir, cur_dir_file)))
+                            have_cleaned = True
+                            dest_dir = os.path.join(orphan_root_dir, cur_dir)
+                            if not os.path.isdir(dest_dir):
+                                os.makedirs(dest_dir)
+                            dir_to_move = os.path.join(cleandir, cur_dir, cur_dir_file)
+                            total_size += get_total_size(dir_to_move)
+                            if not dryrun:
+                                try:
+                                    shutil.move(dir_to_move, dest_dir)
+                                except Exception as e:
+                                    error(e)
+                        # leave other subdirs alone
+                    elif cur_dir_file not in expected_filenames and cur_dir_file not in ORPHAN_FILE_EXCLUDE_LIST:
                         info("orphaning file '{}'".format(os.path.join(cur_dir, cur_dir_file)))
                         have_cleaned = True
                         dest_dir = os.path.join(orphan_root_dir, cur_dir)
@@ -1142,12 +1198,12 @@ def main(args):
         cmd_login(args.username, args.password)
         return  # no need to see time stats
     elif args.cmd == 'update':
-        cmd_update(args.os, args.lang, args.skipknown, args.updateonly, args.id)
+        cmd_update(args.os, args.lang, args.savedir, args.moveoutdated, args.skipknown, args.updateonly, args.id)
     elif args.cmd == 'download':
         if args.wait > 0.0:
             info('sleeping for %.2fhr...' % args.wait)
             time.sleep(args.wait * 60 * 60)
-        cmd_download(args.savedir, args.skipextras, args.skipgames, args.skipids, args.dryrun, args.id)
+        cmd_download(args.savedir, args.skipextras, args.skipgames, args.skippatches, args.skipids, args.dryrun, args.id)
     elif args.cmd == 'import':
         cmd_import(args.src_dir, args.dest_dir)
     elif args.cmd == 'verify':
