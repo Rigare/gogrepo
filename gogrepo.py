@@ -837,10 +837,6 @@ def cmd_download(savedir, skipextras, skipgames, skippatches, skipids, dryrun, i
         ignore_list = skipids.split(",")
         items[:] = [item for item in items if item.title not in ignore_list]
 
-    if randomorder:
-        shuffle(items)
-    else:
-        items = sorted(items, key=lambda g: g.title)
     # Find all items to be downloaded and push into work queue
     for item in items:
         info("{%s}" % item.title)
